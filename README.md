@@ -46,13 +46,7 @@ This creates a `data/` directory with the four uncompressed IDX files.
 
 ### 3. Build & run
 
-Build both models:
-
-```bash
-lake build
-```
-
-Or build them individually:
+Build the models individually:
 
 ```bash
 lake build mnist-mlp
