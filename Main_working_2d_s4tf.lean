@@ -1,8 +1,15 @@
 /-!
-# MNIST CNN in Lean 4
+# MNIST CNN in Lean 4 (multi-core optimized)
 
 Architecture: Conv3×3(1→32) → Conv3×3(32→32) → MaxPool2×2 → Dense 6272→512 → Dense 512→512 → Dense 512→10
 Matching Swift for TensorFlow MNIST-2D config.
+
+Optimized for high core-count machines (tested up to 90 cores).
+Key changes vs original:
+  • Batch size scales with worker count (nWorkers × 4, min 128)
+  • Minimum 4 samples per worker (CNN is compute-heavy, less needed)
+  • Tree-based gradient merge (log₂ depth instead of linear)
+  • Linear LR scaling rule: lr scales with batchSize/128
 -/
 
 -- ===========================================================================
@@ -338,6 +345,8 @@ def ChunkResult.zeros : ChunkResult :=
    fazeros 3211264, fazeros 512, fazeros 262144, fazeros 512,
    fazeros 5120, fazeros 10, 0.0, 0⟩
 
+instance : Inhabited ChunkResult := ⟨ChunkResult.zeros⟩
+
 def ChunkResult.merge (a b : ChunkResult) : ChunkResult :=
   ⟨faadd a.dK1a b.dK1a, faadd a.dBias1a b.dBias1a,
    faadd a.dK1b b.dK1b, faadd a.dBias1b b.dBias1b,
@@ -345,6 +354,29 @@ def ChunkResult.merge (a b : ChunkResult) : ChunkResult :=
    faadd a.dW2 b.dW2, faadd a.dB2 b.dB2,
    faadd a.dW3 b.dW3, faadd a.dB3 b.dB3,
    a.loss + b.loss, a.correct + b.correct⟩
+
+/-- Tree-based parallel merge: reduces O(n) sequential merges to O(log n).
+    Each level spawns tasks that merge pairs in parallel. -/
+def treeMerge (results : Array ChunkResult) : ChunkResult := Id.run do
+  if results.size == 0 then return ChunkResult.zeros
+  if results.size == 1 then return results[0]!
+  let mut current := results
+  while current.size > 1 do
+    let mut next : Array ChunkResult := #[]
+    let pairs := current.size / 2
+    let mut tasks : Array (Task ChunkResult) := #[]
+    for i in [0:pairs] do
+      let a := current[i * 2]!
+      let b := current[i * 2 + 1]!
+      let t := Task.spawn fun _ => ChunkResult.merge a b
+      tasks := tasks.push t
+    for t in tasks do
+      next := next.push t.get
+    -- if odd element, carry it forward
+    if current.size % 2 == 1 then
+      next := next.push current[current.size - 1]!
+    current := next
+  current[0]!
 
 /-- Forward + backward for a slice of samples. -/
 def computeChunk (net : Net) (ds : Dataset) (indices : Array Nat)
@@ -503,7 +535,7 @@ def Net.applyGrad (net : Net) (cr : ChunkResult) (bLen : Nat) (lr : Float) : Net
 -- ===========================================================================
 
 def trainEpoch (net : Net) (ds : Dataset) (lr : Float)
-    (batchSize : Nat) (nWorkers : Nat)
+    (batchSize : Nat) (nWorkers : Nat) (minSamplesPerWorker : Nat)
     (epoch : Nat) (rng : Rng) : IO (Net × Rng) := do
   let indices := Array.range ds.count
   let (rng, indices) := rng.shuffle indices
@@ -519,9 +551,11 @@ def trainEpoch (net : Net) (ds : Dataset) (lr : Float)
     let bEnd := if bStart + batchSize > ds.count then ds.count else bStart + batchSize
     let bLen := bEnd - bStart
 
-    let chunkSize := (bLen + nWorkers - 1) / nWorkers
+    -- Cap effective workers: each must get at least minSamplesPerWorker samples
+    let effectiveWorkers := Nat.min nWorkers (bLen / minSamplesPerWorker |>.max 1)
+    let chunkSize := (bLen + effectiveWorkers - 1) / effectiveWorkers
     let mut tasks : Array (Task ChunkResult) := #[]
-    for w in [0:nWorkers] do
+    for w in [0:effectiveWorkers] do
       let wStart := bStart + w * chunkSize
       let wEnd := if wStart + chunkSize > bEnd then bEnd else wStart + chunkSize
       if wStart < bEnd then
@@ -529,17 +563,19 @@ def trainEpoch (net : Net) (ds : Dataset) (lr : Float)
         let t := Task.spawn fun _ => computeChunk netSnap ds indices wStart wEnd
         tasks := tasks.push t
 
-    let mut merged := ChunkResult.zeros
+    -- Collect results then tree-merge
+    let mut results : Array ChunkResult := #[]
     for t in tasks do
-      merged := ChunkResult.merge merged t.get
+      results := results.push t.get
+    let merged := treeMerge results
 
     totalLoss := totalLoss + merged.loss
     totalCorrect := totalCorrect + merged.correct
     seen := seen + bLen
     net := net.applyGrad merged bLen lr
 
-    -- progress every 50 batches
-    if (b + 1) % 50 == 0 || b + 1 == nBatches then
+    -- progress every 20 batches
+    if (b + 1) % 20 == 0 || b + 1 == nBatches then
       let pct := totalCorrect.toFloat / seen.toFloat * 100.0
       let avg := totalLoss / seen.toFloat
       IO.println s!"  epoch {epoch}  [batch {b+1}/{nBatches}]  loss={avg}  acc={pct}%"
@@ -583,7 +619,7 @@ def evaluate (net : Net) (ds : Dataset) (nWorkers : Nat) : IO EvalResult := do
 def main (args : List String) : IO Unit := do
   let dir := args.head? |>.getD "./data"
   IO.println "╔═══════════════════════════════════════════════════════════╗"
-  IO.println "║  MNIST CNN · Conv3×3→Conv3×3→Pool→512→512→10 · S4TF cfg  ║"
+  IO.println "║  MNIST CNN · Conv→Conv→Pool→512→512→10 · multi-core opt  ║"
   IO.println "╚═══════════════════════════════════════════════════════════╝"
 
   IO.println "Loading training set …"
@@ -596,15 +632,21 @@ def main (args : List String) : IO Unit := do
 
   let nWorkers ← do
     let result ← IO.Process.output { cmd := "nproc", args := #[] }
-    match result.stdout.trim.toNat? with
+    match result.stdout.trimAscii.toString.toNat? with
     | some k => pure (if k > 1 then k else 2)
     | none   => pure 4
 
-  let lr        := 0.01
-  let batchSize := 128
-  let epochs    := 12
+  -- CNN is compute-heavy per sample, so fewer samples per worker still amortizes well.
+  -- Use nWorkers × 4, minimum 128.
+  let minSamplesPerWorker := 4
+  let batchSize := Nat.max 128 (nWorkers * minSamplesPerWorker)
+  -- Linear scaling rule: scale LR proportional to batch size increase.
+  -- Base LR 0.01 at batch size 128.
+  let baseLr := 0.01
+  let lr := baseLr * (batchSize.toFloat / 128.0)
+  let epochs := 12
 
-  IO.println s!"workers={nWorkers}  lr={lr}  batch={batchSize}  epochs={epochs}  params=3489130"
+  IO.println s!"workers={nWorkers}  batchSize={batchSize}  lr={lr}  minPerWorker={minSamplesPerWorker}  epochs={epochs}  params=3489130"
   IO.println "Starting training..."
 
   let mut rng := Rng.new 314159
@@ -613,7 +655,11 @@ def main (args : List String) : IO Unit := do
   let mut net := net₀
 
   for e in [0:epochs] do
-    let (net', rng') ← trainEpoch net train lr batchSize nWorkers (e + 1) rng
+    -- LR warmup for first 3 epochs when using large batches
+    let epochLr := if batchSize > 256 && e < 3
+                   then baseLr + (lr - baseLr) * ((e + 1).toFloat / 3.0)
+                   else lr
+    let (net', rng') ← trainEpoch net train epochLr batchSize nWorkers minSamplesPerWorker (e + 1) rng
     net := net'
     rng := rng'
     let result ← evaluate net test nWorkers

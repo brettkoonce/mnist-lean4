@@ -53,6 +53,7 @@ lake build mnist-mlp
 lake build mnist-cnn
 ```
 
+#### v1
 Run the MLP (~5 minutes):
 
 ```bash
@@ -64,6 +65,14 @@ Run the CNN (~5 hours):
 ```bash
 .lake/build/bin/mnist-cnn ./data
 ```
+
+####  v2:
+
+Improved parallelization:
+
+1D: ~7-8 minutes (3950x)
+2D: ~250 minutes (3950x)
+2D: ~55 minutes (C3D spot instance w/ 180 cores)
 
 ## Understanding the output
 

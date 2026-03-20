@@ -1,12 +1,20 @@
 /-!
-# MNIST in Lean 4 — 3-layer MLP
+# MNIST in Lean 4 — 3-layer MLP (multi-core optimized)
 
-Architecture: 784 → 512 (ReLU) → 512 (ReLU) → 10 (softmax)  [28×28 raw pixels]
+Architecture: 784 → 512 (ReLU) → 512 (ReLU) → 10 (softmax) [28×28 raw pixels]
+
+Optimized for high core-count machines (tested up to 90 cores).
+Key changes vs original:
+  • Batch size scales with worker count (nWorkers × 16, min 128)
+  • Minimum 8 samples per worker to amortize gradient-accumulator allocation
+  • Tree-based gradient merge (log₂ depth instead of linear)
+  • Linear LR scaling rule: lr scales with batchSize/128
+
 Lean v4.28+ compatible.
 -/
 
 -- ===========================================================================
---  RNG
+-- RNG
 -- ===========================================================================
 
 structure Rng where
@@ -40,7 +48,7 @@ def Rng.shuffle (self : Rng) (arr : Array Nat) : Rng × Array Nat := Id.run do
   (rng, a)
 
 -- ===========================================================================
---  FloatArray helpers
+-- FloatArray helpers
 -- ===========================================================================
 
 def fazeros (n : Nat) : FloatArray := Id.run do
@@ -50,7 +58,7 @@ def fazeros (n : Nat) : FloatArray := Id.run do
   a
 
 -- ===========================================================================
---  Softmax / argmax
+-- Softmax / argmax
 -- ===========================================================================
 
 def softmax (v : FloatArray) : FloatArray := Id.run do
@@ -81,12 +89,12 @@ def argmax (v : FloatArray) : Nat := Id.run do
   best
 
 -- ===========================================================================
---  MNIST loading
+-- MNIST loading
 -- ===========================================================================
 
 private def rd32 (b : ByteArray) (off : Nat) : Nat :=
   b[off]!.toNat * 16777216 + b[off+1]!.toNat * 65536 +
-  b[off+2]!.toNat * 256    + b[off+3]!.toNat
+  b[off+2]!.toNat * 256  + b[off+3]!.toNat
 
 private def extractImage28x28 (imgBuf : ByteArray) (imgIdx : Nat) : FloatArray := Id.run do
   let base := 16 + imgIdx * 784
@@ -113,37 +121,36 @@ def Dataset.load (imgPath lblPath : String) (maxN : Nat) : IO Dataset := do
     lbls := lbls.push lb[8 + i]!.toNat
   return ⟨imgs, lbls, n⟩
 
-
 -- ===========================================================================
---  Network: 784 → 512 (ReLU) → 512 (ReLU) → 10 (Softmax)
+-- Network: 784 → 512 (ReLU) → 512 (ReLU) → 10 (Softmax)
 --
---  W1: 512×784 = 401408    b1: 512
---  W2: 512×512 = 262144    b2: 512
---  W3: 10×512  = 5120      b3: 10
---  Total: 669,706 parameters
+-- W1: 512×784 = 401408   b1: 512
+-- W2: 512×512 = 262144   b2: 512
+-- W3: 10×512  = 5120     b3: 10
+-- Total: 669,706 parameters
 -- ===========================================================================
 
 structure Net where
-  w1 : FloatArray     -- 512 × 784 = 401408
-  b1 : FloatArray     -- 512
-  w2 : FloatArray     -- 512 × 512 = 262144
-  b2 : FloatArray     -- 512
-  w3 : FloatArray     -- 10 × 512 = 5120
-  b3 : FloatArray     -- 10
+  w1 : FloatArray   -- 512 × 784 = 401408
+  b1 : FloatArray   -- 512
+  w2 : FloatArray   -- 512 × 512 = 262144
+  b2 : FloatArray   -- 512
+  w3 : FloatArray   -- 10 × 512  = 5120
+  b3 : FloatArray   -- 10
 
 def Net.init (rng : Rng) : Net × Rng := Id.run do
   let mut g := rng
-  let scale1 := Float.sqrt (6.0 / 1296.0)   -- sqrt(6/(512+784))
+  let scale1 := Float.sqrt (6.0 / 1296.0)  -- sqrt(6/(512+784))
   let mut w1 : FloatArray := .empty
   for _ in [0:401408] do
     let (g', v) := g.next; g := g'
     w1 := w1.push (v * scale1)
-  let scale2 := Float.sqrt (6.0 / 1024.0)   -- sqrt(6/(512+512))
+  let scale2 := Float.sqrt (6.0 / 1024.0)  -- sqrt(6/(512+512))
   let mut w2 : FloatArray := .empty
   for _ in [0:262144] do
     let (g', v) := g.next; g := g'
     w2 := w2.push (v * scale2)
-  let scale3 := Float.sqrt (6.0 / 522.0)    -- sqrt(6/(10+512))
+  let scale3 := Float.sqrt (6.0 / 522.0)   -- sqrt(6/(10+512))
   let mut w3 : FloatArray := .empty
   for _ in [0:5120] do
     let (g', v) := g.next; g := g'
@@ -179,7 +186,7 @@ def Net.forward (net : Net) (x : FloatArray) : FloatArray := Id.run do
   softmax z3
 
 -- ===========================================================================
---  FloatArray addition (for merging gradient chunks)
+-- FloatArray addition (for merging gradient chunks)
 -- ===========================================================================
 
 def faadd (a b : FloatArray) : FloatArray := Id.run do
@@ -190,28 +197,53 @@ def faadd (a b : FloatArray) : FloatArray := Id.run do
   c
 
 -- ===========================================================================
---  Parallel training — chunk-based gradient accumulation
+-- Parallel training — chunk-based gradient accumulation
 -- ===========================================================================
 
 structure ChunkResult where
-  accW1 : FloatArray
-  accB1 : FloatArray
-  accW2 : FloatArray
-  accB2 : FloatArray
-  accW3 : FloatArray
-  accB3 : FloatArray
-  loss  : Float
+  accW1   : FloatArray
+  accB1   : FloatArray
+  accW2   : FloatArray
+  accB2   : FloatArray
+  accW3   : FloatArray
+  accB3   : FloatArray
+  loss    : Float
   correct : Nat
 
 def ChunkResult.zeros : ChunkResult :=
   ⟨fazeros 401408, fazeros 512, fazeros 262144, fazeros 512,
-   fazeros 5120, fazeros 10, 0.0, 0⟩
+   fazeros 5120,   fazeros 10,  0.0, 0⟩
+
+instance : Inhabited ChunkResult := ⟨ChunkResult.zeros⟩
 
 def ChunkResult.merge (a b : ChunkResult) : ChunkResult :=
   ⟨faadd a.accW1 b.accW1, faadd a.accB1 b.accB1,
    faadd a.accW2 b.accW2, faadd a.accB2 b.accB2,
    faadd a.accW3 b.accW3, faadd a.accB3 b.accB3,
    a.loss + b.loss, a.correct + b.correct⟩
+
+/-- Tree-based parallel merge: reduces O(n) sequential merges to O(log n).
+    Each level spawns tasks that merge pairs in parallel. -/
+def treeMerge (results : Array ChunkResult) : ChunkResult := Id.run do
+  if results.size == 0 then return ChunkResult.zeros
+  if results.size == 1 then return results[0]!
+  let mut current := results
+  while current.size > 1 do
+    let mut next : Array ChunkResult := #[]
+    let pairs := current.size / 2
+    let mut tasks : Array (Task ChunkResult) := #[]
+    for i in [0:pairs] do
+      let a := current[i * 2]!
+      let b := current[i * 2 + 1]!
+      let t := Task.spawn fun _ => ChunkResult.merge a b
+      tasks := tasks.push t
+    for t in tasks do
+      next := next.push t.get
+    -- if odd element, carry it forward
+    if current.size % 2 == 1 then
+      next := next.push current[current.size - 1]!
+    current := next
+  current[0]!
 
 /-- Pure function: forward+backward over a slice of samples.
     Each Task gets its own gradient accumulators. -/
@@ -225,12 +257,10 @@ def computeChunk (net : Net) (ds : Dataset) (indices : Array Nat)
   let mut accB3 := fazeros 10
   let mut lossSum : Float := 0.0
   let mut correct : Nat := 0
-
   for k in [start:stop] do
     let idx := indices[k]!
     let x := ds.images[idx]!
     let label := ds.labels[idx]!
-
     -- forward (save z1, a1, z2, a2)
     let mut z1 : FloatArray := .empty
     let mut a1 : FloatArray := .empty
@@ -241,7 +271,6 @@ def computeChunk (net : Net) (ds : Dataset) (indices : Array Nat)
         s := s + net.w1[base + j]! * x[j]!
       z1 := z1.push s
       a1 := a1.push (if s > 0.0 then s else 0.0)
-
     let mut z2 : FloatArray := .empty
     let mut a2 : FloatArray := .empty
     for i in [0:512] do
@@ -251,7 +280,6 @@ def computeChunk (net : Net) (ds : Dataset) (indices : Array Nat)
         s := s + net.w2[base + j]! * a1[j]!
       z2 := z2.push s
       a2 := a2.push (if s > 0.0 then s else 0.0)
-
     let mut z3 : FloatArray := .empty
     for i in [0:10] do
       let base := i * 512
@@ -259,12 +287,9 @@ def computeChunk (net : Net) (ds : Dataset) (indices : Array Nat)
       for j in [0:512] do
         s := s + net.w3[base + j]! * a2[j]!
       z3 := z3.push s
-
     let prob := softmax z3
-
     lossSum := lossSum - Float.log (prob[label]! + 1.0e-8)
     if argmax prob == label then correct := correct + 1
-
     -- backward: layer 3
     let mut da2 := fazeros 512
     for i in [0:10] do
@@ -276,7 +301,6 @@ def computeChunk (net : Net) (ds : Dataset) (indices : Array Nat)
         let wIdx := base + j
         accW3 := accW3.set! wIdx (accW3[wIdx]! + dz3i * a2[j]!)
         da2 := da2.set! j (da2[j]! + net.w3[wIdx]! * dz3i)
-
     -- backward: layer 2
     let mut da1 := fazeros 512
     for i in [0:512] do
@@ -287,7 +311,6 @@ def computeChunk (net : Net) (ds : Dataset) (indices : Array Nat)
         let wIdx := base + j
         accW2 := accW2.set! wIdx (accW2[wIdx]! + dz2i * a1[j]!)
         da1 := da1.set! j (da1[j]! + net.w2[wIdx]! * dz2i)
-
     -- backward: layer 1
     for j in [0:512] do
       let dz1j := if z1[j]! > 0.0 then da1[j]! else 0.0
@@ -296,7 +319,6 @@ def computeChunk (net : Net) (ds : Dataset) (indices : Array Nat)
       for p in [0:784] do
         let wIdx := base + p
         accW1 := accW1.set! wIdx (accW1[wIdx]! + dz1j * x[p]!)
-
   ⟨accW1, accB1, accW2, accB2, accW3, accB3, lossSum, correct⟩
 
 /-- Apply averaged gradients to produce new weights. -/
@@ -323,7 +345,7 @@ def Net.applyGrad (net : Net) (cr : ChunkResult) (bLen : Nat) (lr : Float) : Net
   ⟨newW1, newB1, newW2, newB2, newW3, newB3⟩
 
 def trainEpoch (net : Net) (ds : Dataset) (lr : Float)
-    (batchSize : Nat) (nWorkers : Nat)
+    (batchSize : Nat) (nWorkers : Nat) (minSamplesPerWorker : Nat)
     (epoch : Nat) (rng : Rng) : IO (Net × Rng) := do
   let indices := Array.range ds.count
   let (rng, indices) := rng.shuffle indices
@@ -333,34 +355,30 @@ def trainEpoch (net : Net) (ds : Dataset) (lr : Float)
   let mut totalCorrect : Nat := 0
   let mut totalLoss : Float := 0.0
   let mut seen : Nat := 0
-
   for b in [0:nBatches] do
     let bStart := b * batchSize
     let bEnd := if bStart + batchSize > ds.count then ds.count else bStart + batchSize
     let bLen := bEnd - bStart
-
-    -- split batch across workers
-    let chunkSize := (bLen + nWorkers - 1) / nWorkers
+    -- Cap effective workers: each must get at least minSamplesPerWorker samples
+    let effectiveWorkers := Nat.min nWorkers (bLen / minSamplesPerWorker |>.max 1)
+    let chunkSize := (bLen + effectiveWorkers - 1) / effectiveWorkers
     let mut tasks : Array (Task ChunkResult) := #[]
-    for w in [0:nWorkers] do
+    for w in [0:effectiveWorkers] do
       let wStart := bStart + w * chunkSize
       let wEnd := if wStart + chunkSize > bEnd then bEnd else wStart + chunkSize
       if wStart < bEnd then
         let netSnap := net
         let t := Task.spawn fun _ => computeChunk netSnap ds indices wStart wEnd
         tasks := tasks.push t
-
-    -- collect and merge
-    let mut merged := ChunkResult.zeros
+    -- Collect results then tree-merge
+    let mut results : Array ChunkResult := #[]
     for t in tasks do
-      merged := ChunkResult.merge merged t.get
-
+      results := results.push t.get
+    let merged := treeMerge results
     totalLoss := totalLoss + merged.loss
     totalCorrect := totalCorrect + merged.correct
     seen := seen + bLen
-
     net := net.applyGrad merged bLen lr
-
   let pct := totalCorrect.toFloat / seen.toFloat * 100.0
   let avg := totalLoss / seen.toFloat
   IO.println s!"  epoch {epoch}  loss={avg}  train_acc={pct}%"
@@ -397,48 +415,50 @@ def evaluate (net : Net) (ds : Dataset) (nWorkers : Nat) : IO EvalResult := do
   return ⟨correct, ds.count, lossSum / ds.count.toFloat⟩
 
 -- ===========================================================================
---  main
+-- main
 -- ===========================================================================
 
 def main (args : List String) : IO Unit := do
   let dir := args.head? |>.getD "./data"
   IO.println "╔═══════════════════════════════════════════════════════╗"
-  IO.println "║  MNIST · 784→512→512→10 · S4TF-matched config       ║"
+  IO.println "║  MNIST · 784→512→512→10 · multi-core optimized      ║"
   IO.println "╚═══════════════════════════════════════════════════════╝"
-
   IO.println "Loading training set …"
   let train ← Dataset.load (dir ++ "/train-images-idx3-ubyte")
                             (dir ++ "/train-labels-idx1-ubyte") 60000
-
   IO.println "Loading test set …"
-  let test ← Dataset.load (dir ++ "/t10k-images-idx3-ubyte")
-                           (dir ++ "/t10k-labels-idx1-ubyte") 10000
-
+  let test  ← Dataset.load (dir ++ "/t10k-images-idx3-ubyte")
+                            (dir ++ "/t10k-labels-idx1-ubyte") 10000
   -- detect cores
   let nWorkers ← do
     let result ← IO.Process.output { cmd := "nproc", args := #[] }
-    match result.stdout.trim.toNat? with
+    match result.stdout.trimAscii.toString.toNat? with
     | some k => pure (if k > 1 then k else 2)
     | none   => pure 4
-
-  let lr        := 0.1
-  let batchSize := 128
-  let epochs    := 12
-
-  IO.println s!"workers={nWorkers}  lr={lr}  batch={batchSize}  epochs={epochs}  params=669706"
+  -- Scale batch size with workers: each worker should get ≥8 samples.
+  -- Minimum batch size 128, scale up for many cores.
+  let minSamplesPerWorker := 8
+  let batchSize := Nat.max 128 (nWorkers * minSamplesPerWorker)
+  -- Linear scaling rule: scale LR proportional to batch size increase.
+  -- Base LR 0.1 at batch size 128.
+  let baseLr := 0.1
+  let lr := baseLr * (batchSize.toFloat / 128.0)
+  let epochs := 12
+  IO.println s!"workers={nWorkers}  batchSize={batchSize}  lr={lr}  minPerWorker={minSamplesPerWorker}  epochs={epochs}  params=669706"
   IO.println "Starting training..."
-
   let mut rng := Rng.new 314159
   let (net₀, rng') := Net.init rng
   rng := rng'
   let mut net := net₀
-
   for e in [0:epochs] do
-    let (net', rng') ← trainEpoch net train lr batchSize nWorkers (e + 1) rng
+    -- LR warmup for first 2 epochs when using large batches
+    let epochLr := if batchSize > 256 && e < 2
+                   then baseLr + (lr - baseLr) * ((e + 1).toFloat / 2.0)
+                   else lr
+    let (net', rng') ← trainEpoch net train epochLr batchSize nWorkers minSamplesPerWorker (e + 1) rng
     net := net'
     rng := rng'
     let result ← evaluate net test nWorkers
     let accuracy := result.correct.toFloat / result.total.toFloat
     IO.println s!"[Epoch {e + 1}] Accuracy: {result.correct}/{result.total} ({accuracy}) Loss: {result.loss}"
-
   IO.println "\nDone."
