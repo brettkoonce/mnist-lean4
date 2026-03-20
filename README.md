@@ -70,9 +70,9 @@ Run the CNN (~5 hours):
 
 Improved parallelization:
 
-1D: ~7-8 minutes (3950x)
-2D: ~250 minutes (3950x)
-2D: ~55 minutes (C3D spot instance w/ 180 cores)
+ * 1D: ~7-8 minutes (3950x)
+ * 2D: ~250 minutes (3950x)
+ * 2D: ~55 minutes (C3D spot instance w/ 180 cores)
 
 ## Understanding the output
 
